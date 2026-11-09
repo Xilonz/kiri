@@ -15,6 +15,7 @@ pub mod proxy;
 mod domains;
 mod engine;
 mod filters;
+pub(crate) mod grpc;
 mod health;
 mod hostetc;
 mod hostopts;
