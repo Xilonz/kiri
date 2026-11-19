@@ -172,6 +172,8 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     kiri_image::set_config_source(daemon_json::current);
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
+    // The built-in BuildKit relay does the same for buildx's docker driver.
+    grpc::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.
     crate::k8s::sync_at_start();
     // Kiri Dev leaves *.kiri.local and ports 80 and 443 to the installed

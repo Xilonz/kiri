@@ -646,7 +646,6 @@ impl VmLink {
     pub fn buildkit_stop(&self) -> io::Result<()> {
         self.ack(|o| Msg::BuildkitStop.encode(o))
     }
-    }
 
     pub fn remove(&self, id: &str) -> io::Result<()> {
         self.send(|o| Msg::Remove { id }.encode(o))

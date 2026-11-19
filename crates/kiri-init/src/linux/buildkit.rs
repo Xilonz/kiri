@@ -31,11 +31,6 @@ const LOG: &str = "/var/lib/kiri/buildkitd.log";
 /// the mirror address are today's, not a previous run's.
 const CONFIG: &str = "/run/kiri/buildkitd.toml";
 
-/// How long a freshly spawned buildkitd is given to prove it stays alive
-/// before `BuildkitStart` is answered: long enough for a failed exec to
-/// happen, short enough that this adds nothing to the next connection.
-const PROBE: std::time::Duration = std::time::Duration::from_millis(150);
-
 #[derive(Debug, Default)]
 pub struct Buildkit {
     /// The running process, if any.
@@ -60,11 +55,9 @@ impl Buildkit {
         let Some(recipe) = self.recipe.as_ref() else { unreachable!("was just set") };
         let pid = spawn(layer_root, recipe)?;
         self.pid = Some(pid);
-        std::thread::sleep(PROBE);
-        if !alive(pid) {
-            self.pid = None;
-            return Err(io::Error::other(format!("buildkitd exited as soon as it was started (exit {})", exit_code(pid))));
-        }
+        // No sleep here: the agent is single-threaded and a probe would stall
+        // every container's I/O. The host retries its h2 handshake until
+        // buildkitd's socket answers, and a child that dies is reaped below.
         Ok(())
     }
 
@@ -86,25 +79,12 @@ impl Buildkit {
 }
 
 fn alive(pid: libc::pid_t) -> bool {
-    // SAFETY: the null signal only probes liveness; the agent is the
-    // process's parent, so EPERM cannot come up.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-fn exit_code(pid: libc::pid_t) -> i32 {
+    // SAFETY: WNOHANG reaps a child that has exited, which `kill(pid, 0)`
+    // would otherwise still report as living until someone waited for it.
+    // Returning 0 means it is still running; anything else (including
+    // ECHILD, if the agent's main reaper already collected it) means not.
     let mut status = 0;
-    // SAFETY: plain waitpid on a child the agent started.
-    let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if got != pid {
-        return -1;
-    }
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        -1
-    }
+    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == 0 }
 }
 
 /// Writes the config and execs buildkitd from the layers; returns the new
@@ -118,6 +98,10 @@ fn spawn(layer_root: &Path, recipe: &(Vec<String>, String)) -> io::Result<libc::
 
     let binary = which(layer_root, &recipe.0, "usr/bin/buildkitd")
         .map_err(|_| io::Error::other("no layer of the BuildKit image has usr/bin/buildkitd yet (the image is being unpacked, or its pull failed)"))?;
+    // buildkitd execs buildkit-runc (and the other OCI helpers) by name. They
+    // live beside it in the image's layer, not in the guest's own /usr/bin,
+    // so that directory has to be on PATH or the OCI worker cannot start.
+    let bindir = Path::new(&binary).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     // Certificates, for live registries over TLS; absent only if the image's
     // upstream package set changed.
     let certs = which(layer_root, &recipe.0, "etc/ssl/certs/ca-certificates.crt").ok();
@@ -131,7 +115,7 @@ fn spawn(layer_root: &Path, recipe: &(Vec<String>, String)) -> io::Result<libc::
         CString::new("--root")?,
         CString::new(ROOT)?,
     ];
-    let mut env = vec![CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin")?, CString::new("HOME=/root")?];
+    let mut env = vec![CString::new(format!("PATH={bindir}:/usr/sbin:/usr/bin:/sbin:/bin"))?, CString::new("HOME=/root")?];
     if let Some(certs) = &certs {
         env.push(CString::new(format!("SSL_CERT_FILE={certs}"))?);
     }

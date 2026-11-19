@@ -1615,9 +1615,9 @@ mod tests {
     fn the_protocol_version_covers_starting() {
         // A host from before `Started::starting` would take a start still
         // filling a new volume for started and never ask `AwaitStart`; it
-        // speaks 5, and refuses this agent (and this host refuses an agent
-        // that speaks 5, which never answers `starting`).
-        const { assert!(PROTOCOL >= 6) };
+        // speaks 5, and refuses this agent. 7 also carries the BuildKit
+        // messages, so an older agent would refuse every build session.
+        const { assert!(PROTOCOL >= 7) };
         let mut buf = Vec::new();
         Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
         let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };

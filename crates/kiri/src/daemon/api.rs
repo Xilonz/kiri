@@ -22,6 +22,13 @@ use super::time;
 /// Serves one client connection until it closes. `caller`: where it
 /// arrived (caller.rs), which decides whether Kiri's settings are open to it.
 pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Result<()> {
+    // A gRPC client may open with the h2 preface instead of an HTTP/1.1
+    // request line (prior knowledge). Peek without consuming so the relay
+    // gets to read the preface itself.
+    if h2_preface(&stream)? {
+        super::grpc::serve(stream, engine);
+        return Ok(());
+    }
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     while let Some(req) = http::read_request(&mut r, streams_body)? {
@@ -33,6 +40,16 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
         // for it carry the same op.
         let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
         http::serving(&req);
+        // buildx dials the engine socket with `Upgrade: h2c` on /grpc (control)
+        // and /session (its own services). It waits for the 101 before writing
+        // the h2 preface, so nothing is buffered yet: hand the inner stream to
+        // the BuildKit relay, which speaks h2 from here on.
+        if h2c_buildkit(&req) {
+            http::h2c_upgrade(&mut w)?;
+            drop(w);
+            super::grpc::serve(r.into_inner(), engine);
+            return Ok(());
+        }
         // Kiri's own window checks in every few seconds; that isn't use, and
         // counting it would keep the VM from ever sleeping while it's open.
         if req.header("X-Kiri-Background").is_none() {
@@ -79,6 +96,26 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
 /// one, is read out after it, by `http::finish_body`).
 fn streams_body(method: &str, path: &str) -> bool {
     matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
+}
+
+/// Whether the connection opens with HTTP/2's `PRI * HTTP/2.0` preface
+/// (prior knowledge), without consuming any of it.
+fn h2_preface(stream: &UnixStream) -> io::Result<bool> {
+    let mut buf = [0u8; 4];
+    // SAFETY: MSG_PEEK leaves the bytes on the socket; the buffer is ours and
+    // the descriptor is the connection's, which we still own.
+    let n = unsafe { libc::recv(stream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_PEEK) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize == buf.len() && &buf == b"PRI ")
+}
+
+/// buildx's h2c upgrade onto the engine socket's BuildKit endpoints.
+fn h2c_buildkit(req: &Request) -> bool {
+    req.method == "POST"
+        && matches!(req.path.as_str(), "/grpc" | "/session")
+        && req.header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("h2c"))
 }
 
 pub(super) enum Next {
@@ -156,8 +193,8 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
         ("GET" | "HEAD", "/_ping") => {
             // Builder-Version 1: the classic POST /build, which Kiri serves
             // with its managed BuildKit (builder.rs). "2" would tell older
-            // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // CLIs and Compose to use BuildKit inside the engine; buildx
+            // reaches that through the /session and /grpc upgrades directly.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }

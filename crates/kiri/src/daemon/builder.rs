@@ -133,7 +133,9 @@ fn config_toml(limit: u64, registries: &str) -> String {
 /// builder container gets at each start, so both builders share the cache
 /// limits and the `FROM` mirror.
 pub(crate) fn guest_config(engine: &Engine) -> String {
-    config_toml(cache_limit(), &super::mirror::config(engine))
+    let names = super::mirror::registry_names(engine);
+    let current = Registries::now(&names);
+    config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names))
 }
 
 /// The pinned BuildKit image's layers, newest first, for `BuildkitStart`;

@@ -378,7 +378,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
 
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
-            for pid in reap(&mut procs) {
+            for pid in reap(procs) {
                 // Not a container this time: the builder root process.
                 buildkit.reaped(pid);
             }
