@@ -4879,6 +4879,62 @@ mod tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Replays buildx's first requests against the engine socket (as the PR
+    /// review did) at the API layer, with a VM-less engine: the upgrade routes
+    /// must answer 101 instead of 404, prior knowledge must be handed to the
+    /// relay rather than answered with an HTTP status, and /_ping is unchanged.
+    #[test]
+    fn buildx_first_requests_are_answered_by_the_relay() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!("kiri-buildx-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        // The relay asks for the pinned image's layers; a record keeps the
+        // test from pulling it, and stopped=true keeps it from booting a VM.
+        engine.store.put_image(kiri_image::Image {
+            name: super::super::builder::IMAGE.into(),
+            digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(), mirror: None,
+        }).unwrap();
+
+        let raw = |bytes: &[u8]| -> String {
+            let e = engine.clone();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            std::thread::spawn(move || { let _ = super::serve(server, e, Caller::Host); });
+            client.write_all(bytes).unwrap();
+            client.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+            let mut out = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                        if !out.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        };
+
+        let ping = raw(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n");
+        assert!(ping.contains("Builder-Version: 1"), "{ping}");
+        for path in ["/grpc", "/session"] {
+            let req = format!("POST {path} HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+            let response = raw(req.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 101"), "{path}: {response}");
+        }
+        // Prior knowledge goes straight to the relay: no HTTP answer at all,
+        // certainly not the 404 an unrecognised route would produce.
+        let response = raw(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert!(!response.starts_with("HTTP/1.1"), "prior knowledge: {response}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
