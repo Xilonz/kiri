@@ -2600,11 +2600,12 @@ fn ipam_config(want4: &str, want6: &str) -> Value {
 /// networks and healthcheck state.
 fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let id = engine.resolve(key)?;
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
+    let net = engine.lock_net();
+    let networks = net.all();
     let health = engine.health(&id);
     engine.with(&id, |c| {
-        let mut v = inspect(c, &networks);
-        v["NetworkSettings"]["Networks"] = endpoints(c, &networks);
+        let mut v = inspect(c, networks);
+        v["NetworkSettings"]["Networks"] = endpoints(c, networks);
         // The old top-level fields describe the default bridge only.
         if c.spec.network_mode == "bridge" {
             let ep = v["NetworkSettings"]["Networks"]["bridge"].clone();
@@ -2641,7 +2642,8 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let ancestors = f.values("ancestor").map(|v| engine.ancestor_ids(v)).transpose()?;
     // A status filter lists stopped containers without --all, as Docker does.
     let all = req.flag("all") || f.values("status").is_some() || f.values("exited").is_some();
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
+    let net = engine.lock_net();
+    let networks = net.all();
     let mut rows = engine.each(|c| {
         if !all && c.status != Status::Running {
             return None;
@@ -2681,7 +2683,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
                 "Ports": ports_list(c),
                 "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
                 "HostConfig": {"NetworkMode": c.spec.network_mode},
-                "NetworkSettings": {"Networks": endpoints(c, &networks)},
+                "NetworkSettings": {"Networks": endpoints(c, networks)},
                 "Mounts": c.spec.mount_info,
             }),
         ))
