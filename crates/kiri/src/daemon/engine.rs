@@ -907,6 +907,27 @@ struct Saved {
     health: Option<super::health::Health>,
 }
 
+#[derive(Serialize)]
+struct SavedRef<'a> {
+    id: &'a str,
+    name: &'a str,
+    spec: &'a Spec,
+    layers: &'a [String],
+    created_ns: u64,
+    status: Status,
+    started_ns: Option<u64>,
+    finished_ns: Option<u64>,
+    exit_code: i32,
+    #[serde(default)]
+    oom_killed: bool,
+    #[serde(default)]
+    vm_stopped: bool,
+    stopped_by_user: bool,
+    restart_count: u32,
+    #[serde(default)]
+    health: Option<&'a super::health::Health>,
+}
+
 /// What `load` reads of `containers.json`.
 struct Records {
     saved: Vec<Saved>,
@@ -2140,15 +2161,15 @@ impl Engine {
         }
         let json = {
             let st = self.lock();
-            let saved: Vec<Saved> = st
+            let saved: Vec<SavedRef<'_>> = st
                 .containers
                 .values()
                 .filter(|c| !c.spec.auto_remove)
-                .map(|c| Saved {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    spec: c.spec.clone(),
-                    layers: c.layers.clone(),
+                .map(|c| SavedRef {
+                    id: &c.id,
+                    name: &c.name,
+                    spec: &c.spec,
+                    layers: &c.layers,
                     created_ns: ns(c.created),
                     status: c.status,
                     started_ns: c.started.map(ns),
@@ -2158,7 +2179,7 @@ impl Engine {
                     vm_stopped: c.vm_stopped,
                     stopped_by_user: c.stopped_by_user,
                     restart_count: c.restart_count,
-                    health: st.health.get(&c.id).map(|h| h.health.clone()),
+                    health: st.health.get(&c.id).map(|h| &h.health),
                 })
                 .collect();
             serde_json::to_vec(&saved)

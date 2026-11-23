@@ -602,8 +602,13 @@ impl Ingest {
     /// Publishes the blob under its digest. Returns (digest, size).
     pub fn finish(mut self) -> io::Result<(String, u64)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
+        let dest = self.root.join("blobs/sha256").join(&hex);
+        if dest.exists() {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written));
+        }
         self.file.sync_all()?;
-        fs::rename(&self.tmp, self.root.join("blobs/sha256").join(&hex))?;
+        fs::rename(&self.tmp, dest)?;
         Ok((format!("sha256:{hex}"), self.written))
     }
 
@@ -613,10 +618,14 @@ impl Ingest {
     /// an image that names it (`docker load`).
     pub fn finish_pinned(mut self) -> io::Result<(String, u64, Pin)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
-        self.file.sync_all()?;
         let dest = self.root.join("blobs/sha256").join(&hex);
         let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pin = Pin::take(dest.clone());
+        if dest.exists() {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written, pin));
+        }
+        self.file.sync_all()?;
         fs::rename(&self.tmp, &dest)?;
         Ok((format!("sha256:{hex}"), self.written, pin))
     }
