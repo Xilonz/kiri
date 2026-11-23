@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::reference::Reference;
 use crate::store::{Image, Layer, RunConfig, Store};
@@ -36,6 +37,24 @@ pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
             (&mut entry).take(MAX_JSON).read_to_end(&mut buf)?;
             manifest = Some(buf);
             continue;
+        }
+        // Fast path for content-addressed blobs (OCI archive layout, e.g. blobs/sha256/<hex>):
+        // If the blob already exists in the store with matching size, verify the stream
+        // in memory to advance tar without creating a temp file, writing to disk, or fsyncing.
+        let size = entry.header().size()?;
+        if let Some(hex) = path.strip_prefix("blobs/sha256/") {
+            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let digest = format!("sha256:{hex}");
+                if store.has_blob(&digest, size) {
+                    let pin = store.pin(&digest);
+                    let (computed_digest, computed_size) = hash_entry(&mut entry)?;
+                    if computed_size == size && computed_digest == digest {
+                        pins.push(pin);
+                        files.insert(path, (digest, size));
+                        continue;
+                    }
+                }
+            }
         }
         // Every other file is kept, `.json` ones too: in the classic layout
         // (podman save, older docker save) the image config is a top-level
@@ -201,6 +220,28 @@ pub fn from_config(name: String, config_digest: &str, config: &Value, layers: Ve
             user: text(&c["User"]),
         },
     }
+}
+
+fn hash_entry(mut r: impl Read) -> io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let finalize = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in finalize {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 15) as usize] as char);
+    }
+    Ok((format!("sha256:{s}"), total))
 }
 
 #[cfg(test)]
@@ -394,5 +435,71 @@ mod tests {
         assert_eq!(tagged("alpine"), "alpine:latest");
         assert_eq!(tagged("localhost:5000/app"), "localhost:5000/app:latest");
         assert_eq!(tagged("app:1"), "app:1");
+    }
+
+    #[test]
+    fn fast_path_skips_disk_write_for_existing_blobs() {
+        let dir = scratch();
+        let store = Store::open(&dir).unwrap();
+        let mut layer_builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        let data = b"fast path test content\n";
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        layer_builder.append_data(&mut h, "data.txt", &data[..]).unwrap();
+        let layer_bytes = layer_builder.into_inner().unwrap();
+        let layer_digest = crate::store::sha256_digest(&layer_bytes);
+        let layer_hex = layer_digest.strip_prefix("sha256:").unwrap();
+
+        let config = json!({"architecture": "arm64", "os": "linux", "created": "2026-11-23T00:00:00Z",
+            "config": {"Cmd": ["/bin/sh"]},
+            "rootfs": {"type": "layers", "diff_ids": []}});
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let config_digest = crate::store::sha256_digest(&config_bytes);
+        let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+
+        let manifest = json!([{
+            "Config": format!("blobs/sha256/{config_hex}"),
+            "RepoTags": ["fastpath:v1"],
+            "Layers": [format!("blobs/sha256/{layer_hex}")]
+        }]);
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_size(config_bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        archive.append_data(&mut h, format!("blobs/sha256/{config_hex}"), config_bytes.as_slice()).unwrap();
+
+        let mut h = tar::Header::new_ustar();
+        h.set_size(layer_bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        archive.append_data(&mut h, format!("blobs/sha256/{layer_hex}"), layer_bytes.as_slice()).unwrap();
+
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(manifest_bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        archive.append_data(&mut h, "manifest.json", manifest_bytes.as_slice()).unwrap();
+
+        let tar_data = archive.into_inner().unwrap();
+
+        // First load ingests normally:
+        let first = load(&store, tar_data.as_slice()).unwrap();
+        assert_eq!(first.len(), 1);
+        let blob_path = store.blob_path(&layer_digest).unwrap();
+        let mtime_before = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
+
+        // Second load of the exact same OCI tar archive hits the fast-path:
+        let second = load(&store, tar_data.as_slice()).unwrap();
+        assert_eq!(second.len(), 1);
+        let mtime_after = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
+        // The blob file on disk was not rewritten:
+        assert_eq!(mtime_before, mtime_after);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
