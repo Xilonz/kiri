@@ -126,6 +126,16 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         let http10 = parts.next().is_some_and(|v| v.eq_ignore_ascii_case("HTTP/1.0"));
         let method = method.to_owned();
         let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+        // Absolute-form request targets (RFC 9112 §3.2.2: `http://host:port/path`):
+        // docker-modem / dockerode sends these over the Unix socket.
+        let raw_path = if let Some(rest) = raw_path.strip_prefix("http://").or_else(|| raw_path.strip_prefix("https://")) {
+            match rest.find('/') {
+                Some(idx) => &rest[idx..],
+                None => "/",
+            }
+        } else {
+            raw_path
+        };
         // Decoded once, here, so every route that reads a name from the
         // path — an image's `%2F` repository slash above all — resolves the
         // name, not its encoding, as Docker's router does.
@@ -694,6 +704,10 @@ mod tests {
         assert_eq!(path_of("/images/a+b/json"), "/images/a+b/json");
         // An invalid escape stays written, as in query values.
         assert_eq!(path_of("/images/100%/json"), "/images/100%/json");
+        // Absolute-form request targets (RFC 9112 §3.2.2) sent by docker-modem / dockerode
+        assert_eq!(path_of("http://127.0.0.1:2376/containers/json"), "/containers/json");
+        assert_eq!(path_of("http://localhost:2376/v1.41/containers/json"), "/containers/json");
+        assert_eq!(path_of("https://localhost/info"), "/info");
     }
 
     /// `attach` and `exec` start answer `101` only to a client that asked to
